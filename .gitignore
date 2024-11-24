@@ -1,52 +1,184 @@
-# Prerequisites
-*.d
+#include <webots/robot.h>
+#include <webots/distance_sensor.h>
+#include <webots/light_sensor.h>
+#include <webots/motor.h>
+#include <webots/gps.h>
+#include <stdio.h>
+#include <math.h>
+#include <stdbool.h>
 
-# Object files
-*.o
-*.ko
-*.obj
-*.elf
+#define TIME_STEP 64
+#define MAX_SENSORS 8
+#define MAX_SPEED 6.28
+#define WALL_THRESHOLD 100.0
+#define GPS_THRESHOLD 0.07
 
-# Linker output
-*.ilk
-*.map
-*.exp
+// Device Tags
+WbDeviceTag distance_sensor[MAX_SENSORS];
+WbDeviceTag light_sensor[MAX_SENSORS];
+WbDeviceTag right_motor, left_motor;
+WbDeviceTag gps;
 
-# Precompiled Headers
-*.gch
-*.pch
+// State variables
+double light_deadend[11];
+double gps_coordinates[10][3];
+int dead_end_count = 0;
+double dead_end_timer = 0.0;
+int nest = 0;
+int target_reached = 0;
+double max_light = 0.0;
+int brightest_dead_end = 0;
 
-# Libraries
-*.lib
-*.a
-*.la
-*.lo
+// Initialization function
+void initialize() {
+  wb_robot_init();
 
-# Shared objects (inc. Windows DLLs)
-*.dll
-*.so
-*.so.*
-*.dylib
+  // Initialize motors
+  right_motor = wb_robot_get_device("right wheel motor");
+  left_motor = wb_robot_get_device("left wheel motor");
+  wb_motor_set_position(right_motor, INFINITY);
+  wb_motor_set_position(left_motor, INFINITY);
+  wb_motor_set_velocity(right_motor, 0.0);
+  wb_motor_set_velocity(left_motor, 0.0);
 
-# Executables
-*.exe
-*.out
-*.app
-*.i*86
-*.x86_64
-*.hex
+  // Initialize distance sensors
+  char distance_sensor_names[MAX_SENSORS][5] = {"ps0", "ps1", "ps2", "ps3", "ps4", "ps5", "ps6", "ps7"};
+  for (int i = 0; i < MAX_SENSORS; i++) {
+    distance_sensor[i] = wb_robot_get_device(distance_sensor_names[i]);
+    wb_distance_sensor_enable(distance_sensor[i], TIME_STEP);
+  }
 
-# Debug files
-*.dSYM/
-*.su
-*.idb
-*.pdb
+  // Initialize light sensors
+  char light_sensor_names[MAX_SENSORS][5] = {"ls0", "ls1", "ls2", "ls3", "ls4", "ls5", "ls6", "ls7"};
+  for (int i = 0; i < MAX_SENSORS; i++) {
+    light_sensor[i] = wb_robot_get_device(light_sensor_names[i]);
+    wb_light_sensor_enable(light_sensor[i], TIME_STEP);
+  }
 
-# Kernel Module Compile Results
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
+  // Initialize GPS
+  gps = wb_robot_get_device("gps");
+  wb_gps_enable(gps, TIME_STEP);
+}
+
+// Function to detect a dead-end
+bool detect_dead_end() {
+  double front_distance = wb_distance_sensor_get_value(distance_sensor[0]);
+  double current_time = wb_robot_get_time();
+
+  if (front_distance > WALL_THRESHOLD) {
+    if (dead_end_count == 0 || (current_time - dead_end_timer) > 1.7) {
+      dead_end_timer = current_time;
+      dead_end_count++;
+    }
+  }
+
+  if (dead_end_count >= 2) {
+    dead_end_count = 0;
+    return true;
+  }
+
+  if ((current_time - dead_end_timer) > 10.0) {
+    dead_end_count = 0;
+  }
+
+  return false;
+}
+
+// Function to process sensors and control the robot
+void read_sensors(double *right_speed, double *left_speed) {
+  double front_distance = wb_distance_sensor_get_value(distance_sensor[0]);
+  double right_wall_distance = wb_distance_sensor_get_value(distance_sensor[2]);
+  double right_corner_distance = wb_distance_sensor_get_value(distance_sensor[1]);
+  double light_sum = 0.0;
+  for (int i = 0; i < MAX_SENSORS; i++) {
+    light_sum += wb_light_sensor_get_value(light_sensor[i]);
+  }
+  double light_average = light_sum / MAX_SENSORS;
+  const double *gps_values = wb_gps_get_values(gps);
+
+  // Print sensor values with neat formatting
+  printf("\nSensor Readings:\n");
+  printf("-----------------------------------\n");
+  printf("Front Distance Sensor:      %.2f\n", front_distance);
+  printf("Right Wall Distance Sensor: %.2f\n", right_wall_distance);
+  printf("Right Corner Distance Sensor: %.2f\n", right_corner_distance);
+  printf("Average Light Sensor Value:  %.2f\n", light_average);
+  printf("GPS Coordinates:             x = %.2f, y = %.2f, z = %.2f\n", gps_values[0], gps_values[1], gps_values[2]);
+  printf("-----------------------------------\n");
+
+  // Dead-end detection and handling
+  if (detect_dead_end()) {
+    if (nest < 10) {
+      nest++;
+      light_deadend[nest] = light_average;
+
+      gps_coordinates[nest - 1][0] = gps_values[0];
+      gps_coordinates[nest - 1][1] = gps_values[1];
+      gps_coordinates[nest - 1][2] = gps_values[2];
+
+      printf("\nDead End %d Detected\n", nest);
+      printf("Light Intensity: %.2f\n", light_deadend[nest]);
+      printf("Coordinates:       x = %.2f, y = %.2f, z = %.2f\n", gps_values[0], gps_values[1], gps_values[2]);
+    }
+
+    if (nest == 10) {
+      for (int i = 1; i <= 10; i++) {
+        if (light_deadend[i] > max_light) {
+          max_light = light_deadend[i];
+          brightest_dead_end = i;
+        }
+      }
+      printf("\nBrightest Light Detected at Dead End %d\n", brightest_dead_end);
+      printf("Light Intensity: %.2f\n", max_light);
+      printf("Coordinates:       x = %.2f, y = %.2f, z = %.2f\n",
+             gps_coordinates[brightest_dead_end - 1][0],
+             gps_coordinates[brightest_dead_end - 1][1],
+             gps_coordinates[brightest_dead_end - 1][2]);
+      nest++;
+    }
+
+    if (fabs(gps_values[0] - gps_coordinates[brightest_dead_end - 1][0]) < GPS_THRESHOLD &&
+        fabs(gps_values[1] - gps_coordinates[brightest_dead_end - 1][1]) < GPS_THRESHOLD &&
+        fabs(gps_values[2] - gps_coordinates[brightest_dead_end - 1][2]) < GPS_THRESHOLD) {
+      printf("\nTarget Position Reached at Dead End %d\n", brightest_dead_end);
+      target_reached = 1;
+    }
+  } else {
+    if (front_distance > WALL_THRESHOLD) {
+      *right_speed = MAX_SPEED;
+      *left_speed = -MAX_SPEED; // Turn
+    } else if (right_wall_distance > WALL_THRESHOLD) {
+      *right_speed = MAX_SPEED / 2;
+      *left_speed = MAX_SPEED / 2; // Move forward
+    } else if (right_corner_distance > WALL_THRESHOLD) {
+      *right_speed = MAX_SPEED;
+      *left_speed = MAX_SPEED / 4; // Slight right
+    } else {
+      *right_speed = MAX_SPEED / 4;
+      *left_speed = MAX_SPEED; // Slight left
+    }
+  }
+}
+
+// Main function
+int main() {
+  initialize();
+
+  double right_speed = MAX_SPEED;
+  double left_speed = MAX_SPEED;
+
+  while (wb_robot_step(TIME_STEP) != -1) {
+    read_sensors(&right_speed, &left_speed);
+    wb_motor_set_velocity(right_motor, right_speed);
+    wb_motor_set_velocity(left_motor, left_speed);
+
+    if (target_reached) {
+      wb_motor_set_velocity(right_motor, 0);
+      wb_motor_set_velocity(left_motor, 0);
+      break;
+    }
+  }
+
+  wb_robot_cleanup();
+  return 0;
+}
